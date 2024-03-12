@@ -1,0 +1,116 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for creating AWS resources
+
+Parameters:
+
+  ConfigParamName:
+    Description: Reference name for the configuration parameter
+    Type: String
+    Default: "/motle/service_monitor_config"
+
+  LogGroupName:
+    Description: Log Group Name
+    Type: String
+    Default: "/motle/service_monitor_logs"
+    
+  WebServices:
+    Description: Web Services Tag
+    Type: String
+
+  DBServices:
+    Description: DB Services Tag
+    Type: String
+
+  ec2Tag:
+    Description: EC2 General Tag
+    Type: String
+
+
+
+Resources:
+  MotleConfigParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Ref ConfigParamName
+      Type: String
+      Value: !Sub "{\"WEB\": ${WebServices}, \"DB\": ${DBServices}, \"ec2Tag\": \"${ec2Tag}\", \"LogGroupName\": \"${LogGroupName}\"}"
+      Description: "Config for the python script"
+  
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+  
+  LambdaPermissionForCloudWatchLogs:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt MotleLambdaFunction.Arn
+      Principal: 'logs.amazonaws.com'
+      SourceArn: !GetAtt MotleLogGroup.Arn
+  
+  MotleLambdaFunction:
+      DependsOn: LambdaRole
+      Type: AWS::Lambda::Function
+      Properties:
+        Handler: index.lambda_handler
+        Role: !GetAtt LambdaRole.Arn
+        Code:
+          ZipFile: |
+            import json
+            import base64
+            import gzip
+            def lambda_handler(event, context):
+                cw_data = event['awslogs']['data']
+                compressed_payload = base64.b64decode(cw_data)
+                uncompressed_payload = gzip.decompress(compressed_payload)
+                payload = json.loads(uncompressed_payload)
+                
+                log_events = payload['logEvents']
+                for log_event in log_events:
+                  sys_stats = json.loads(log_event['message'])
+                  print(sys_stats)
+                  
+        Runtime: python3.10
+  
+  MotleLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub ${LogGroupName}
+  
+  MotleLogStream:
+    DependsOn: MotleLogGroup
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Sub ${LogGroupName}
+      LogStreamName: "motle_services"
+  
+  MotleSubscriptionFilter:
+      Type: AWS::Logs::SubscriptionFilter
+      Properties:
+        LogGroupName: !Sub ${MotleLogGroup}
+        FilterPattern: "{$.service_status=\"inactive\"}"
+        DestinationArn: !GetAtt MotleLambdaFunction.Arn
+  
+Outputs:
+  MotleLogGroup:
+    Value: !GetAtt MotleLogGroup.Arn
+  MotleConfig:
+    Value: !GetAtt MotleConfigParameter.Name
